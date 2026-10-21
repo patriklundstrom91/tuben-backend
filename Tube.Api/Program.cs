@@ -94,7 +94,7 @@ app.MapGet("/api/stations/nearby", async (double lat, double lon, int? limit, IH
         .Select(site => new { site.Id, site.Name, site.Lat, site.Lon, site.Distance });
     return Results.Ok(result);
 });
-app.MapGet("/api/trips", async (double lat, double lon, string destination, string? originStation, IHttpClientFactory clients, CancellationToken ct) =>
+app.MapGet("/api/trips", async (double lat, double lon, string destination, string? originStation, string? date, string? time, string? timeMode, IHttpClientFactory clients, CancellationToken ct) =>
 {
     if (string.IsNullOrWhiteSpace(destination)) return Results.BadRequest(new { message = "Ange en destination." });
     if (!double.IsFinite(lat) || !double.IsFinite(lon) || lat is < -90 or > 90 || lon is < -180 or > 180)
@@ -109,11 +109,59 @@ app.MapGet("/api/trips", async (double lat, double lon, string destination, stri
     if (!string.IsNullOrWhiteSpace(originStation) && originStopId is null)
         return Results.NotFound(new { message = $"Hittade ingen SL-hållplats för stationen {originStation}." });
 
+    var requestedTime = DateTime.MinValue;
+    var hasRequestedTime = !string.IsNullOrWhiteSpace(date) && !string.IsNullOrWhiteSpace(time)
+        && DateTime.TryParseExact($"{date} {time}", "yyyy-MM-dd HH:mm", System.Globalization.CultureInfo.InvariantCulture, System.Globalization.DateTimeStyles.None, out requestedTime);
+    if ((!string.IsNullOrWhiteSpace(date) || !string.IsNullOrWhiteSpace(time)) && !hasRequestedTime)
+        return Results.BadRequest(new { message = "Ange datum och tid i formatet yyyy-MM-dd och HH:mm." });
+    var arrivalMode = string.Equals(timeMode, "arrival", StringComparison.OrdinalIgnoreCase);
+    var stockholmTimeZone = TimeZoneInfo.FindSystemTimeZoneById(OperatingSystem.IsWindows() ? "W. Europe Standard Time" : "Europe/Stockholm");
     var originType = originStopId is null ? "coord" : "any";
     var originName = originStopId ?? $"{lon.ToString(System.Globalization.CultureInfo.InvariantCulture)}:{lat.ToString(System.Globalization.CultureInfo.InvariantCulture)}:WGS84[dd.ddddd]";
-    var query = $"type_origin={originType}&name_origin={Uri.EscapeDataString(originName)}&type_destination=any&name_destination={Uri.EscapeDataString(destinationStopId)}&calc_number_of_trips=3&calc_one_direction=true&incl_mot_2=true&incl_mot_5=false&language=sv";
-    var result = await planner.GetFromJsonAsync<JsonElement>($"trips?{query}", ct);
-    return Results.Ok(result);
+    var journeys = new List<JsonElement>();
+    var cursor = hasRequestedTime
+        ? new DateTimeOffset(requestedTime, stockholmTimeZone.GetUtcOffset(requestedTime))
+        : TimeZoneInfo.ConvertTime(DateTimeOffset.UtcNow, stockholmTimeZone);
+    // SL returns at most three requested trips per call. Page from the last
+    // result so the UI can offer ten sequential alternatives.
+    for (var page = 0; page < 4 && journeys.Count < 10; page++)
+    {
+        var query = $"type_origin={originType}&name_origin={Uri.EscapeDataString(originName)}&type_destination=any&name_destination={Uri.EscapeDataString(destinationStopId)}&calc_number_of_trips=3&calc_one_direction=true&incl_mot_2=true&incl_mot_5=false&language=sv";
+        if (hasRequestedTime || page > 0)
+        {
+            var localCursor = TimeZoneInfo.ConvertTime(cursor, stockholmTimeZone);
+            query += $"&itd_date={localCursor:yyyyMMdd}&itd_time={localCursor:HHmm}&itd_trip_date_time_dep_arr={(arrivalMode ? "arr" : "dep")}";
+        }
+        var result = await planner.GetFromJsonAsync<JsonElement>($"trips?{query}", ct);
+        if (result.ValueKind != JsonValueKind.Object || !result.TryGetProperty("journeys", out var pageJourneys) || pageJourneys.ValueKind != JsonValueKind.Array || pageJourneys.GetArrayLength() == 0) break;
+        var pageItems = pageJourneys.EnumerateArray().ToArray();
+        var added = 0;
+        foreach (var journey in pageItems)
+        {
+            var legs = journey.TryGetProperty("legs", out var legsValue) && legsValue.ValueKind == JsonValueKind.Array ? legsValue.EnumerateArray().ToArray() : [];
+            var transitLeg = legs.FirstOrDefault(leg => leg.TryGetProperty("transportation", out var transport) && transport.TryGetProperty("product", out var product) && product.TryGetProperty("class", out var productClass) && productClass.GetInt32() == 2);
+            if (transitLeg.ValueKind == JsonValueKind.Undefined) continue;
+            var key = journey.TryGetProperty("properties", out var props) && props.TryGetProperty("tripId", out var tripId) ? tripId.GetString() : null;
+            if (key is not null && journeys.Any(existing => existing.TryGetProperty("properties", out var existingProps) && existingProps.TryGetProperty("tripId", out var existingId) && existingId.GetString() == key)) continue;
+            journeys.Add(journey);
+            added++;
+        }
+        var last = pageItems.Last();
+        if (!last.TryGetProperty("legs", out var lastLegs) || lastLegs.ValueKind != JsonValueKind.Array) break;
+        var transitLegs = lastLegs.EnumerateArray().Where(leg => leg.TryGetProperty("transportation", out var transport) && transport.TryGetProperty("product", out var product) && product.TryGetProperty("class", out var productClass) && productClass.GetInt32() == 2).ToArray();
+        var relevantLeg = transitLegs.Length == 0 ? default : arrivalMode ? transitLegs[^1] : transitLegs[0];
+        if (relevantLeg.ValueKind == JsonValueKind.Undefined) break;
+        if (!TryGetTripTime(relevantLeg, arrivalMode, out var tripTime)) break;
+        cursor = tripTime.AddMinutes(arrivalMode ? -1 : 1);
+        if (added == 0 && pageItems.Length < 3) break;
+    }
+    var ordered = journeys.OrderBy(journey => {
+        var legs = journey.TryGetProperty("legs", out var legsValue) && legsValue.ValueKind == JsonValueKind.Array ? legsValue.EnumerateArray().ToArray() : Array.Empty<JsonElement>();
+        var transitLegs = legs.Where(item => item.TryGetProperty("transportation", out var transport) && transport.TryGetProperty("product", out var product) && product.TryGetProperty("class", out var productClass) && productClass.GetInt32() == 2).ToArray();
+        var leg = transitLegs.Length == 0 ? default : arrivalMode ? transitLegs[^1] : transitLegs[0];
+        return leg.ValueKind != JsonValueKind.Undefined && TryGetTripTime(leg, arrivalMode, out var parsed) ? parsed : DateTimeOffset.MaxValue;
+    }).Take(10).ToArray();
+    return Results.Ok(new { journeys = ordered });
 });
 app.MapGet("/api/stations/{siteId:int}/departures", async (int siteId, string? direction, IHttpClientFactory clients, CancellationToken ct) =>
 {
@@ -161,6 +209,19 @@ static async Task<string?> FindBestStopIdAsync(HttpClient planner, string name, 
     var best = candidates.FirstOrDefault(location => location.TryGetProperty("isBest", out var isBest) && isBest.ValueKind == JsonValueKind.True);
     if (best.ValueKind == JsonValueKind.Undefined) best = candidates[0];
     return best.TryGetProperty("id", out var id) ? id.GetString() : null;
+}
+
+static bool TryGetTripTime(JsonElement leg, bool arrival, out DateTimeOffset parsed)
+{
+    parsed = default;
+    var placeKey = arrival ? "destination" : "origin";
+    if (!leg.TryGetProperty(placeKey, out var place) && !leg.TryGetProperty(char.ToUpperInvariant(placeKey[0]) + placeKey[1..], out place)) return false;
+    var prefix = arrival ? "arrivalTime" : "departureTime";
+    foreach (var suffix in new[] { "Estimated", "Planned", "BaseTimetable" })
+    {
+        if (place.TryGetProperty(prefix + suffix, out var value) && DateTimeOffset.TryParse(value.GetString(), out parsed)) return true;
+    }
+    return false;
 }
 
 static double DistanceKm(double lat1, double lon1, double lat2, double lon2)
