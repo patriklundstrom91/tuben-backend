@@ -30,7 +30,7 @@ jobs:
         run: dotnet publish ./Tube.Api/Tube.Api.csproj --configuration Release --output "${{ runner.temp }}/myapp"
 
       - name: Upload artifact for deployment job
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: .net-app
           path: ${{ runner.temp }}/myapp
@@ -41,7 +41,7 @@ jobs:
 
     steps:
       - name: Download artifact from build job
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: .net-app
 
@@ -50,6 +50,5 @@ jobs:
         uses: azure/webapps-deploy@v3
         with:
           app-name: 'kollatuben-api'
-          slot-name: 'Production'
           package: .
           publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_86CB5B9755A14D63B0DA734A0AF9C3F0 }}
