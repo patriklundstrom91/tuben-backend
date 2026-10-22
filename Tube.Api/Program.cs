@@ -4,6 +4,13 @@ using Microsoft.Extensions.Caching.Memory;
 using Tube.Api.Weather;
 
 var builder = WebApplication.CreateBuilder(args);
+// SL's static stop-point catalog can include planned metro stations before
+// they enter service. Keep these out of nearby results until they open.
+var metroStationsNotYetInService = new HashSet<string>(StringComparer.Ordinal)
+{
+    "hagalund", "södrahagalund", "hagastaden", "arenastaden",
+    "barkarbystaden", "barkarby", "sofia", "hammarbykanal", "järla", "nacka"
+};
 builder.Services.AddHttpClient("sl", c =>
 {
     c.BaseAddress = new Uri("https://transport.integration.sl.se/v1/");
@@ -74,7 +81,8 @@ app.MapGet("/api/stations/nearby", async (double lat, double lon, int? limit, IH
             && areas.EnumerateArray().Any(area =>
             {
                 var areaId = area.GetInt32();
-                if (!metroStationsByAreaId.TryGetValue(areaId, out var stationName)) return false;
+                if (!metroStationsByAreaId.TryGetValue(areaId, out var stationName)
+                    || metroStationsNotYetInService.Contains(NormalizeStationName(stationName))) return false;
                 var rawName = site.GetProperty("name").GetString() ?? "";
                 var siteName = rawName.StartsWith("Stockholm ", StringComparison.OrdinalIgnoreCase) ? rawName["Stockholm ".Length..] : rawName;
                 return NormalizeStationName(siteName) == NormalizeStationName(stationName);
